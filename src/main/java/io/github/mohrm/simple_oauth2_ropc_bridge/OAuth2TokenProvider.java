@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -27,11 +28,14 @@ public final class OAuth2TokenProvider {
      * We reserve 5 minutes of validity to avoid using a token that could expire during transport,
      * retries, or small clock drifts between this service and the IdP.
      */
-    private static final int CLOCK_SKEW_SECONDS = 300;
+    private static final long DEFAULT_CLOCK_SKEW_SECONDS = 300L;
 
-    private static final Pattern ACCESS_TOKEN_PATTERN = Pattern.compile("\"access_token\"\\s*:\\s*\"([^\"]+)\"");
-    private static final Pattern REFRESH_TOKEN_PATTERN = Pattern.compile("\"refresh_token\"\\s*:\\s*\"([^\"]+)\"");
-    private static final Pattern EXPIRES_IN_PATTERN = Pattern.compile("\"expires_in\"\\s*:\\s*(\\d+)");
+    private static final Pattern ACCESS_TOKEN_PATTERN = Pattern.compile(
+            "\\\"\\s*access_token\\s*\\\"\\s*:\\s*\\\"\\s*((?:\\\\.|[^\\\"\\\\])+)\\s*\\\"");
+    private static final Pattern REFRESH_TOKEN_PATTERN = Pattern.compile(
+            "\\\"\\s*refresh_token\\s*\\\"\\s*:\\s*\\\"\\s*((?:\\\\.|[^\\\"\\\\])+)\\s*\\\"");
+    private static final Pattern EXPIRES_IN_PATTERN = Pattern.compile(
+            "\\\"\\s*expires_in\\s*\\\"\\s*:\\s*(\\d+)");
 
     private final HttpClient httpClient;
     private final URI tokenEndpoint;
@@ -39,6 +43,7 @@ public final class OAuth2TokenProvider {
     private final String clientSecret;
     private final String username;
     private final String password;
+    private final long clockSkewSeconds;
 
     private final AtomicReference<TokenRecord> tokenState = new AtomicReference<>();
     private final ReentrantLock refreshLock = new ReentrantLock();
@@ -51,12 +56,25 @@ public final class OAuth2TokenProvider {
             String username,
             String password
     ) {
+        this(httpClient, tokenEndpoint, clientId, clientSecret, username, password, DEFAULT_CLOCK_SKEW_SECONDS);
+    }
+
+    public OAuth2TokenProvider(
+            HttpClient httpClient,
+            URI tokenEndpoint,
+            String clientId,
+            String clientSecret,
+            String username,
+            String password,
+            long clockSkewSeconds
+    ) {
         this.httpClient = Objects.requireNonNull(httpClient, "httpClient must not be null");
         this.tokenEndpoint = Objects.requireNonNull(tokenEndpoint, "tokenEndpoint must not be null");
         this.clientId = Objects.requireNonNull(clientId, "clientId must not be null");
         this.clientSecret = Objects.requireNonNull(clientSecret, "clientSecret must not be null");
         this.username = Objects.requireNonNull(username, "username must not be null");
         this.password = Objects.requireNonNull(password, "password must not be null");
+        this.clockSkewSeconds = clockSkewSeconds;
     }
 
     public String getAccessToken() {
@@ -76,13 +94,13 @@ public final class OAuth2TokenProvider {
                 return cached.accessToken();
             }
 
-            TokenRecord refreshed = tryRefreshToken(cached);
+            final TokenRecord refreshed = tryRefreshToken(cached);
             if (refreshed != null) {
                 tokenState.set(refreshed);
                 return refreshed.accessToken();
             }
 
-            TokenRecord ropc = requestPasswordGrant();
+            final TokenRecord ropc = requestPasswordGrant();
             tokenState.set(ropc);
             return ropc.accessToken();
         } finally {
@@ -91,7 +109,7 @@ public final class OAuth2TokenProvider {
     }
 
     private boolean isValid(TokenRecord tokenRecord, Instant now) {
-        return tokenRecord != null && tokenRecord.isUsable(now, CLOCK_SKEW_SECONDS);
+        return tokenRecord != null && tokenRecord.isUsable(now, Math.toIntExact(clockSkewSeconds));
     }
 
     private TokenRecord tryRefreshToken(TokenRecord current) {
@@ -111,7 +129,7 @@ public final class OAuth2TokenProvider {
             return requestToken(formParameters);
         } catch (RuntimeException ex) {
             LOGGER.log(System.Logger.Level.WARNING,
-                    "Refresh-token flow failed, falling back to password flow. Error: " + ex.getMessage());
+                    "Refresh-token flow failed, falling back to password flow. Error: {0}", ex.getMessage());
             return null;
         }
     }
@@ -130,51 +148,56 @@ public final class OAuth2TokenProvider {
     }
 
     private TokenRecord requestToken(Map<String, String> formParameters) {
-        HttpRequest request = HttpRequest.newBuilder(tokenEndpoint)
+        final HttpRequest request = HttpRequest.newBuilder(tokenEndpoint)
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(buildFormBody(formParameters)))
                 .build();
 
         try {
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            int statusCode = response.statusCode();
-            String body = response.body();
+            final HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            final int statusCode = response.statusCode();
+            final String responseBody = response.body();
 
             if (statusCode < 200 || statusCode >= 300) {
                 LOGGER.log(System.Logger.Level.ERROR,
-                        "IdP token endpoint returned non-2xx status " + statusCode + ".");
-                throw new RuntimeException(
-                        "Token request failed with status " + statusCode + ", response body: " + body);
+                        "IdP token endpoint returned non-2xx status {0}.", statusCode);
+                throw new RuntimeException("Token request failed");
             }
 
-            return parseTokenResponse(body);
+            return parseTokenResponse(responseBody);
         } catch (IOException e) {
             throw new RuntimeException("I/O error during token request", e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Token request was interrupted", e);
+        } catch (RuntimeException e) {
+            throw new RuntimeException("Token request failed", e);
         }
     }
 
     private TokenRecord parseTokenResponse(String responseBody) {
-        String accessToken = extractRequired(responseBody, ACCESS_TOKEN_PATTERN, "access_token");
-        String refreshToken = extractOptional(responseBody, REFRESH_TOKEN_PATTERN);
-        long expiresInSeconds = Long.parseLong(extractRequired(responseBody, EXPIRES_IN_PATTERN, "expires_in"));
+        try {
+            final String accessToken = extractRequired(responseBody, ACCESS_TOKEN_PATTERN, "access_token");
+            final String refreshToken = extractOptional(responseBody, REFRESH_TOKEN_PATTERN);
+            final long expiresInSeconds = Long.parseLong(extractRequired(responseBody, EXPIRES_IN_PATTERN, "expires_in"));
 
-        Instant expiresAt = Instant.now().plusSeconds(expiresInSeconds);
-        return new TokenRecord(accessToken, refreshToken, expiresAt);
+            final Instant expiresAt = Instant.now().plusSeconds(expiresInSeconds);
+            return new TokenRecord(accessToken, refreshToken, expiresAt);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse token response", e);
+        }
     }
 
     private String extractRequired(String body, Pattern pattern, String fieldName) {
-        String value = extractOptional(body, pattern);
+        final String value = extractOptional(body, pattern);
         if (value == null) {
-            throw new RuntimeException("Field '" + fieldName + "' missing in token response: " + body);
+            throw new RuntimeException("Field '" + fieldName + "' missing in token response");
         }
         return value;
     }
 
     private String extractOptional(String body, Pattern pattern) {
-        Matcher matcher = pattern.matcher(body);
+        final Matcher matcher = pattern.matcher(body);
         if (matcher.find()) {
             return matcher.group(1);
         }
@@ -182,16 +205,9 @@ public final class OAuth2TokenProvider {
     }
 
     private String buildFormBody(Map<String, String> formParameters) {
-        StringBuilder builder = new StringBuilder();
-        for (Map.Entry<String, String> entry : formParameters.entrySet()) {
-            if (builder.length() > 0) {
-                builder.append('&');
-            }
-            builder.append(urlEncode(entry.getKey()))
-                    .append('=')
-                    .append(urlEncode(entry.getValue()));
-        }
-        return builder.toString();
+        return formParameters.entrySet().stream()
+                .map(entry -> urlEncode(entry.getKey()) + "=" + urlEncode(entry.getValue()))
+                .collect(Collectors.joining("&"));
     }
 
     private String urlEncode(String value) {
