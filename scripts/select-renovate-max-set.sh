@@ -8,6 +8,7 @@ BASE_BRANCH="main"
 CACHE_FILE=".build-cache"
 FILTER_PATTERN=""
 CREATE_FINAL_BRANCH=""
+MERGE_STRATEGY="theirs"
 
 TEMP_BRANCH=""
 ORIGINAL_REF=""
@@ -24,6 +25,7 @@ Options:
   --base <branch>          Base branch used for all tests (default: main)
   --cache <file>           Cache file path (default: .build-cache)
   --create-final <branch>  Create/update this branch with final selected merges
+  --merge-strategy <mode>  Merge mode: strict | theirs (default: theirs)
   -h, --help               Show this help
 
 Arguments:
@@ -112,13 +114,30 @@ prepare_temp_branch() {
 merge_branches_no_commit() {
   local branches=("$@")
   local b
+  local -a merge_args=(--no-ff --no-commit)
+
+  if [[ "${MERGE_STRATEGY}" == "theirs" ]]; then
+    merge_args+=(-X theirs)
+  fi
+
   for b in "${branches[@]}"; do
-    log "Merging ${b}"
-    if ! git merge --no-ff --no-commit "${b}" >/dev/null 2>&1; then
-      log "Merge conflict while merging ${b}"
-      git merge --abort >/dev/null 2>&1 || true
-      return 1
+    log "Merging ${b} (strategy=${MERGE_STRATEGY})"
+    if git merge "${merge_args[@]}" "${b}" >/dev/null 2>&1; then
+      continue
     fi
+
+    if [[ "${MERGE_STRATEGY}" == "theirs" ]]; then
+      log "Merge reported conflicts for ${b}; attempting automatic 'theirs' resolution"
+      git checkout --theirs . >/dev/null 2>&1 || true
+      git add -A
+      if [[ -z "$(git ls-files -u)" ]]; then
+        continue
+      fi
+    fi
+
+    log "Merge conflict while merging ${b}"
+    git merge --abort >/dev/null 2>&1 || true
+    return 1
   done
   return 0
 }
@@ -270,6 +289,10 @@ main() {
         CREATE_FINAL_BRANCH="$2"
         shift 2
         ;;
+      --merge-strategy)
+        MERGE_STRATEGY="$2"
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -284,6 +307,10 @@ main() {
   require_clean_repo
   require_base_branch
   init_cache
+
+  if [[ "${MERGE_STRATEGY}" != "strict" && "${MERGE_STRATEGY}" != "theirs" ]]; then
+    die "Invalid --merge-strategy: ${MERGE_STRATEGY}. Use strict or theirs."
+  fi
 
   ORIGINAL_REF="$(git rev-parse --abbrev-ref HEAD)"
   TEMP_BRANCH="test-combination-$$"

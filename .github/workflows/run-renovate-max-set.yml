@@ -19,6 +19,10 @@ on:
         description: "Optional final branch to create from selected merges"
         required: false
         default: ""
+      merge_strategy:
+        description: "Merge strategy for conflicting updates (strict|theirs)"
+        required: false
+        default: "theirs"
       push_final_branch:
         description: "Push created final branch to origin"
         required: false
@@ -58,7 +62,7 @@ jobs:
           set -euo pipefail
           chmod +x scripts/select-renovate-max-set.sh
 
-          args=("--base" "${{ inputs.base_branch }}" "--cache" "${{ inputs.cache_file }}")
+          args=("--base" "${{ inputs.base_branch }}" "--cache" "${{ inputs.cache_file }}" "--merge-strategy" "${{ inputs.merge_strategy }}")
 
           if [[ -n "${{ inputs.create_final_branch }}" ]]; then
             args+=("--create-final" "${{ inputs.create_final_branch }}")
