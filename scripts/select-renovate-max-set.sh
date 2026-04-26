@@ -25,7 +25,7 @@ Options:
   --base <branch>          Base branch used for all tests (default: main)
   --cache <file>           Cache file path (default: .build-cache)
   --create-final <branch>  Create/update this branch with final selected merges
-  --merge-strategy <mode>  Merge mode: strict | theirs (default: theirs)
+  --merge-strategy <mode>  Merge mode: strict | theirs | cherry-pick (default: theirs)
   -h, --help               Show this help
 
 Arguments:
@@ -121,7 +121,39 @@ merge_branches_no_commit() {
   fi
 
   for b in "${branches[@]}"; do
-    log "Merging ${b} (strategy=${MERGE_STRATEGY})"
+    log "Applying ${b} (strategy=${MERGE_STRATEGY})"
+
+    if [[ "${MERGE_STRATEGY}" == "cherry-pick" ]]; then
+      local -a commits=()
+      mapfile -t commits < <(git rev-list --reverse "HEAD..${b}")
+
+      if ((${#commits[@]} == 0)); then
+        log "No new commits to cherry-pick from ${b}"
+        continue
+      fi
+
+      local c
+      for c in "${commits[@]}"; do
+        if git cherry-pick --no-commit -X theirs "${c}" >/dev/null 2>&1; then
+          continue
+        fi
+
+        log "Cherry-pick conflict for commit ${c}; attempting automatic 'theirs' resolution"
+        git checkout --theirs . >/dev/null 2>&1 || true
+        git add -A
+
+        if [[ -z "$(git ls-files -u)" ]]; then
+          git cherry-pick --quit >/dev/null 2>&1 || true
+          continue
+        fi
+
+        log "Conflict while cherry-picking commit ${c} from ${b}"
+        git cherry-pick --abort >/dev/null 2>&1 || true
+        return 1
+      done
+      continue
+    fi
+
     if git merge "${merge_args[@]}" "${b}" >/dev/null 2>&1; then
       continue
     fi
@@ -309,8 +341,8 @@ main() {
   require_base_branch
   init_cache
 
-  if [[ "${MERGE_STRATEGY}" != "strict" && "${MERGE_STRATEGY}" != "theirs" ]]; then
-    die "Invalid --merge-strategy: ${MERGE_STRATEGY}. Use strict or theirs."
+  if [[ "${MERGE_STRATEGY}" != "strict" && "${MERGE_STRATEGY}" != "theirs" && "${MERGE_STRATEGY}" != "cherry-pick" ]]; then
+    die "Invalid --merge-strategy: ${MERGE_STRATEGY}. Use strict, theirs or cherry-pick."
   fi
 
   ORIGINAL_REF="$(git rev-parse --abbrev-ref HEAD)"
