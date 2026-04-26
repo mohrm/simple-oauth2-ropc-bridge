@@ -249,8 +249,9 @@ resolve_conflicts() {
     SELECTED+=("${first[@]}")
     resolve_conflicts "${second[@]}"
   else
-    log "First half failed; recursing into first half only"
+    log "First half failed; recursing into both halves"
     resolve_conflicts "${first[@]}"
+    resolve_conflicts "${second[@]}"
   fi
 }
 
