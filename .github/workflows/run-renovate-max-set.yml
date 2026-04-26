@@ -1,0 +1,85 @@
+name: Run Renovate Max Set Selector
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: "Base branch used for merge testing"
+        required: false
+        default: "main"
+      filter_pattern:
+        description: "Optional regex filter for renovate branches"
+        required: false
+        default: ""
+      cache_file:
+        description: "Cache file path"
+        required: false
+        default: ".build-cache"
+      create_final_branch:
+        description: "Optional final branch to create from selected merges"
+        required: false
+        default: ""
+      push_final_branch:
+        description: "Push created final branch to origin"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  select-renovate-set:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Ensure full remote refs are available
+        run: git fetch --all --prune
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Run selector script
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/select-renovate-max-set.sh
+
+          args=("--base" "${{ inputs.base_branch }}" "--cache" "${{ inputs.cache_file }}")
+
+          if [[ -n "${{ inputs.create_final_branch }}" ]]; then
+            args+=("--create-final" "${{ inputs.create_final_branch }}")
+          fi
+
+          if [[ -n "${{ inputs.filter_pattern }}" ]]; then
+            args+=("${{ inputs.filter_pattern }}")
+          fi
+
+          scripts/select-renovate-max-set.sh "${args[@]}"
+
+      - name: Upload build cache
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: renovate-max-set-cache
+          path: ${{ inputs.cache_file }}
+          if-no-files-found: ignore
+
+      - name: Push final branch
+        if: ${{ inputs.create_final_branch != '' && inputs.push_final_branch }}
+        run: |
+          set -euo pipefail
+          git push --force-with-lease origin "${{ inputs.create_final_branch }}"
